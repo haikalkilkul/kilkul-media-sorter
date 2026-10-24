@@ -113,6 +113,12 @@ body{min-width:0;overflow:hidden}
 .move-button:hover:not(:disabled){border-color:var(--focus);background:#2b3626}
 .move-button:disabled{opacity:.55;cursor:wait}
 .item-actions{flex:0 0 auto}
+.item-actions .rename-button{height:30px;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid #3a4038;border-radius:4px;padding:0 9px;font-size:10px;line-height:1;white-space:nowrap;cursor:pointer}
+.item-actions .rename-button svg{display:block;flex:0 0 auto}
+.item-actions .rename-button kbd{margin-left:4px}
+.item-actions .rename-button:hover:not(:disabled){background:#252925;border-color:#56634a;color:var(--text)}
+.item-actions .rename-button:disabled{opacity:.42;cursor:not-allowed}
+.item-actions button:focus-visible{outline-offset:-3px}
 .media-stage .file-info{max-width:calc(100% - 300px)}
 :root[data-theme="light"] .move-button{background:#e9f0e2;border-color:#b7c8a8;color:#405b30}
 :root[data-theme="light"] .move-button:hover:not(:disabled){background:#dce8d1}

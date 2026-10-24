@@ -83,6 +83,18 @@ async function sendPreview(request: FastifyRequest<{ Params: { id: string }; Que
 }
 
 export function registerMediaRoutes(app: FastifyInstance, registry: FolderRegistry): void {
+  app.patch<{ Params: { id: string }; Body: { scanId: string; basename: string } }>('/api/media/:id/rename', {
+    preValidation: async request => {
+      const body = request.body;
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => key !== 'scanId' && key !== 'basename')) {
+        throw new FolderError('Invalid request.', 400);
+      }
+    },
+    schema: {
+      params: { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[a-f0-9]{32}$' } } },
+      body: { type: 'object', additionalProperties: false, required: ['scanId', 'basename'], properties: { scanId: { type: 'string', format: 'uuid' }, basename: { type: 'string', minLength: 1, maxLength: 240 } } },
+    },
+  }, async (request, reply) => reply.send(await registry.renameMedia(request.params.id, request.body.scanId, request.body.basename)));
   const route = {
     schema: {
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[a-f0-9]{32}$' } } },

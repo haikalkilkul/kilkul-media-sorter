@@ -16,7 +16,7 @@ export type BatchMoveItemResult =
 export type BatchMoveResponse = { results: BatchMoveItemResult[] };
 
 export class ApiError extends Error {
-  constructor(message: string, readonly uncertain = false) { super(message); }
+  constructor(message: string, readonly uncertain = false, readonly rescanRequired = false) { super(message); }
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -25,7 +25,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     const message = payload && typeof payload === 'object' && 'error' in payload && typeof payload.error === 'string'
       ? payload.error : `Local API request failed (${response.status}).`;
-    throw new ApiError(message, Boolean(payload && typeof payload === 'object' && 'uncertain' in payload && payload.uncertain === true));
+    throw new ApiError(message, Boolean(payload && typeof payload === 'object' && 'uncertain' in payload && payload.uncertain === true), Boolean(payload && typeof payload === 'object' && 'rescanRequired' in payload && payload.rescanRequired === true));
   }
   return payload as T;
 }
@@ -38,6 +38,10 @@ export const api = {
   addDestination: (path: string) => request<ConfiguredFolder>('/api/folders/destinations', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ path }) }),
   removeDestination: (id: string) => request<void>(`/api/folders/destinations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   scan: () => request<ScanResult>('/api/scan', { method: 'POST', headers: jsonHeaders, body: '{}' }),
+  renameMedia: async (id: string, scanId: string, basename: string) => {
+    try { return await request<{ filename: string; unchanged: boolean }>(`/api/media/${encodeURIComponent(id)}/rename`, { method: 'PATCH', headers: jsonHeaders, body: JSON.stringify({ scanId, basename }) }); }
+    catch (reason) { if (reason instanceof ApiError) throw reason; throw new ApiError('The rename result could not be confirmed. Rescan the source and check the filename before retrying.', true, true); }
+  },
   previewUrl: (id: string, scanId: string) => `/api/media/${encodeURIComponent(id)}/preview?scan=${encodeURIComponent(scanId)}`,
   moveMedia: async (id: string, scanId: string, destinationId: string) => {
     try {

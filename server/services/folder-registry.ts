@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { access, lstat, open, realpath, stat, type FileHandle } from 'node:fs/promises';
+import { access, link, lstat, open, readdir, realpath, stat, unlink, type FileHandle } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import { discoverMediaWithIndex, type DiscoveryResult, type MediaFingerprint } from './media-discovery.js';
@@ -14,9 +14,11 @@ export type BatchMoveResult =
   | { id: string; status: 'failed'; code: string; message: string; uncertain: boolean };
 const maxBatchSize = 100;
 const batchConcurrency = 3;
+const invalidBasenameCharacters = /[\\/:*?"<>|\u0000-\u001f]/;
+const windowsReservedBasename = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 
 export class FolderError extends Error {
-  constructor(message: string, readonly statusCode: number, readonly uncertain = false) { super(message); }
+  constructor(message: string, readonly statusCode: number, readonly uncertain = false, readonly rescanRequired = false) { super(message); }
 }
 
 function containsPath(parent: string, candidate: string): boolean {
@@ -230,6 +232,154 @@ export class FolderRegistry {
       this.movingBatches.delete(batchKey);
       this.adjustDestinationMove(destinationId, -1);
     }
+  }
+
+  async renameMedia(id: string, scanId: string, basename: string): Promise<{ filename: string; unchanged: boolean }> {
+    if (!/^[a-f0-9]{32}$/.test(id)) throw new FolderError('Media item not found. Scan the source again.', 404);
+    if (this.movingMedia.has(id)) throw new FolderError('This file already has an operation in progress.', 409);
+    if (!this.source || scanId !== this.currentScanId) throw new FolderError('This media is from an older scan. Refresh the queue.', 409, false, true);
+    const source = this.source;
+    const item = this.media.get(id);
+    const fingerprint = this.fingerprints.get(id);
+    if (!item || !fingerprint) throw new FolderError('Media item is no longer in the current scan. Scan the source again.', 404, false, true);
+    if (typeof basename !== 'string') throw new FolderError('Enter a valid filename.', 400);
+    if (invalidBasenameCharacters.test(basename)) throw new FolderError('Enter a name without path separators or control characters.', 400);
+    const stem = basename.trim();
+    const filename = `${stem}${item.extension}`;
+    if (!stem || stem === '.' || stem === '..' || stem.length > 240 || /[ .]$/.test(basename) || windowsReservedBasename.test(stem)) {
+      throw new FolderError('Enter a valid name. Avoid path separators, control characters, Windows reserved names, and trailing spaces or periods.', 400);
+    }
+    if (filename.length > 255) throw new FolderError('That filename is too long for this folder.', 400);
+
+    const sourcePath = path.resolve(source.path, ...fingerprint.relativePath.split('/'));
+    if (!containsPath(source.path, sourcePath) || sourcePath === source.path) throw new FolderError('Media item is outside the configured source folder.', 404);
+    const directory = path.dirname(sourcePath);
+    const targetPath = path.join(directory, filename);
+    const folded = (value: string) => value.normalize('NFC').toLocaleLowerCase('en-US');
+    const sameName = (left: string, right: string) => folded(left) === folded(right);
+    this.movingMedia.add(id);
+    let handle: FileHandle | undefined;
+    let sourceRemoved = false;
+    let filesystemTouched = false;
+    try {
+      const rootInfo = await lstat(source.path);
+      const directoryInfo = await lstat(directory);
+      if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory() || directoryInfo.isSymbolicLink() || !directoryInfo.isDirectory()) {
+        throw new FolderError('The source folder changed. Scan the source again before renaming files.', 409, false, true);
+      }
+      if (await realpath(source.path) !== source.path || !containsPath(source.path, await realpath(directory))) {
+        throw new FolderError('The media directory is no longer inside the configured source folder.', 409, false, true);
+      }
+      const before = await lstat(sourcePath);
+      if (!before.isFile() || before.isSymbolicLink() || before.size !== fingerprint.sizeBytes || before.mtimeMs !== fingerprint.mtimeMs || before.ctimeMs !== fingerprint.ctimeMs || before.dev !== fingerprint.dev || before.ino !== fingerprint.ino) {
+        throw new FolderError('The file changed since scanning. Rescan before renaming it.', 409, false, true);
+      }
+      handle = await open(sourcePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      const opened = await handle.stat();
+      if (!opened.isFile() || opened.size !== fingerprint.sizeBytes || opened.mtimeMs !== fingerprint.mtimeMs || opened.ctimeMs !== fingerprint.ctimeMs || opened.dev !== fingerprint.dev || opened.ino !== fingerprint.ino) {
+        throw new FolderError('The file changed while opening. Rescan before renaming it.', 409, false, true);
+      }
+
+      const entries = await readdir(directory);
+      const foldedCollision = entries.find(name => sameName(name, filename));
+      if (foldedCollision === item.filename && filename === item.filename) return { filename, unchanged: true };
+      if (foldedCollision && foldedCollision !== item.filename) throw new FolderError('Another file already uses that name.', 409);
+
+      const expectedSameFile = (filePath: string) => lstat(filePath).then(info => info.isFile() && info.size === fingerprint.sizeBytes && info.mtimeMs === fingerprint.mtimeMs && info.dev === fingerprint.dev && info.ino === fingerprint.ino, () => false);
+      const assertCurrentFile = async () => {
+        if (this.source?.id !== source.id || this.currentScanId !== scanId || !this.media.has(id) || !this.fingerprints.has(id)) throw new FolderError('The scan changed while renaming. Rescan the source folder.', 409);
+        const pathInfo = await lstat(sourcePath);
+        const handleInfo = await handle!.stat();
+        if (!pathInfo.isFile() || pathInfo.isSymbolicLink() || pathInfo.size !== fingerprint.sizeBytes || pathInfo.mtimeMs !== fingerprint.mtimeMs || pathInfo.dev !== fingerprint.dev || pathInfo.ino !== fingerprint.ino || handleInfo.dev !== fingerprint.dev || handleInfo.ino !== fingerprint.ino) {
+          throw new FolderError('The file changed before the rename could be committed.', 409, false, true);
+        }
+      };
+
+      if (foldedCollision === item.filename) {
+        // A case-only rename needs a temporary hard link because the requested name
+        // resolves to the existing entry on case-insensitive filesystems. Every
+        // creation uses link(), which fails if the target already exists.
+        let temporaryPath = '';
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          temporaryPath = path.join(directory, `.kilkul-rename-${randomUUID()}.tmp`);
+          try { await link(sourcePath, temporaryPath); filesystemTouched = true; break; }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || attempt === 4) throw error; }
+        }
+        try {
+          if (!(await expectedSameFile(temporaryPath))) throw new FolderError('The temporary rename link could not be verified.', 409);
+          await assertCurrentFile();
+          await unlink(sourcePath);
+          sourceRemoved = true;
+          try {
+            await link(temporaryPath, targetPath);
+          } catch (error) {
+            try { await link(temporaryPath, sourcePath); filesystemTouched = true; sourceRemoved = false; await unlink(temporaryPath); }
+            catch { throw new FolderError('Rename was interrupted. The file remains at a temporary name; inspect the source folder before retrying.', 500, true); }
+            if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new FolderError('Another file already uses that name. The original name was restored.', 409);
+            throw error;
+          }
+          if (!(await expectedSameFile(targetPath))) throw new FolderError('The renamed file could not be verified. Inspect the source folder before retrying.', 500, true);
+          await unlink(temporaryPath);
+          sourceRemoved = false;
+        } catch (error) {
+          if (sourceRemoved) {
+            try { await link(temporaryPath, sourcePath); filesystemTouched = true; sourceRemoved = false; } catch { /* Retain the verified temporary link rather than overwrite a racing entry. */ }
+          }
+          if (!sourceRemoved) await unlink(temporaryPath).catch(() => undefined);
+          throw error;
+        }
+      } else {
+        await assertCurrentFile();
+        try { await link(sourcePath, targetPath); filesystemTouched = true; }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new FolderError('Another file already uses that name.', 409);
+          throw error;
+        }
+        if (!(await expectedSameFile(targetPath))) {
+          throw new FolderError('The file changed while renaming. The original was preserved.', 409);
+        }
+        try {
+          await assertCurrentFile();
+          await unlink(sourcePath);
+          sourceRemoved = true;
+        } catch (error) {
+          const targetIsSource = await expectedSameFile(targetPath);
+          if (targetIsSource) await unlink(targetPath).catch(() => undefined);
+          if (sourceRemoved) throw new FolderError('The file was renamed, but the old name could not be safely reconciled. Rescan the source folder.', 500, true);
+          throw error;
+        }
+      }
+
+      this.invalidateScan();
+      return { filename, unchanged: false };
+    } catch (error) {
+      if (sourceRemoved || filesystemTouched) {
+        this.invalidateScan();
+        if (error instanceof FolderError) {
+          if (!error.rescanRequired) throw new FolderError(error.message, error.statusCode, error.uncertain, true);
+        } else {
+          throw new FolderError('The rename could not be confirmed. Rescan the source and verify the filename before retrying.', 500, sourceRemoved, true);
+        }
+      }
+      if (error instanceof FolderError) throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP') throw new FolderError('The file or its folder is no longer available. Rescan the source folder.', 409);
+      if (code === 'EACCES' || code === 'EPERM' || code === 'EBUSY') throw new FolderError('The file is locked or the rename is not permitted.', 403);
+      if (code === 'EEXIST') throw new FolderError('Another file already uses that name.', 409);
+      throw new FolderError('The file could not be renamed safely.', 500);
+    } finally {
+      await handle?.close().catch(() => undefined);
+      this.movingMedia.delete(id);
+    }
+  }
+
+  private invalidateScan(): void {
+    this.scanVersion += 1;
+    this.currentScanId = null;
+    this.media.clear();
+    this.fingerprints.clear();
+    this.previewController.abort();
+    this.previewController = new AbortController();
   }
 
   private assertMoveContext(ids: string[], scanId: string, destinationId: string): void {

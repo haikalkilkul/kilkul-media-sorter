@@ -21,7 +21,7 @@ export async function createApp(options: { logger?: boolean; registry?: FolderRe
   });
 
   app.setErrorHandler((error, _request, reply) => {
-    if (error instanceof FolderError) return reply.code(error.statusCode).send({ error: error.message, ...(error.uncertain ? { uncertain: true } : {}) });
+    if (error instanceof FolderError) return reply.code(error.statusCode).send({ error: error.message, ...(error.uncertain ? { uncertain: true } : {}), ...(error.rescanRequired ? { rescanRequired: true } : {}) });
     if (typeof error === 'object' && error !== null && 'validation' in error && error.validation) {
       return reply.code(400).send({ error: 'Invalid request.' });
     }

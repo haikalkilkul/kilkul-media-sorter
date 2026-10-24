@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Aperture, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Film, FolderOpen, Image as ImageIcon, Keyboard, Moon, Plus, ScanLine, Sun, X } from 'lucide-react';
+import { Aperture, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Film, FolderOpen, Image as ImageIcon, Keyboard, Moon, Plus, ScanLine, Sun, X, Pencil } from 'lucide-react';
 import type { FormEvent } from 'react';
 import { api, ApiError, type BatchMoveItemResult, type ConfiguredFolder, type FolderConfiguration, type MediaItem, type ScanResult } from './services/api';
 import { MediaDetails } from './components/MediaDetails';
 import { canStartHoldSeek, HoldSeekController, isEditableKeyboardTarget, seekVideoBy } from './utils/video-seek';
 import { getMoveTargetIds, reconcileMovedQueue } from './utils/move-queue';
 import { adjacentQueueIndex, getQueueNavigationIntent, HoldNavigationController, inclusiveQueueRange, rebaseQueueAnchor, type QueueDirection } from './utils/queue-navigation';
+import { createRenameQueueSync, reconcileRenameQueue, type RenameQueueSync } from './utils/rename-queue';
 
 type Theme = 'dark' | 'light';
 type VideoPreviewState = { key: string; status: 'loading' | 'buffering' | 'ready' | 'error'; currentTime: number; duration: number | null; message?: string };
@@ -42,6 +43,12 @@ export default function MediaSorterApp() {
   const [queueOpen, setQueueOpen] = useState(true);
   const [helpOpen, setHelpOpen] = useState(false);
   const [batchDetailsOpen, setBatchDetailsOpen] = useState(false);
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameName, setRenameName] = useState('');
+  const [renameError, setRenameError] = useState('');
+  const [renameBusy, setRenameBusy] = useState(false);
+  const [needsRescan, setNeedsRescan] = useState(false);
+  const renameSyncRef = useRef<RenameQueueSync | null>(null);
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [loadingFolders, setLoadingFolders] = useState(true);
   const [configuring, setConfiguring] = useState(false);
@@ -90,6 +97,7 @@ export default function MediaSorterApp() {
   const setSource = async (event: FormEvent<HTMLFormElement>) => {
     if (movingRef.current) return;
     event.preventDefault();
+    renameSyncRef.current = null; setNeedsRescan(false); setRenameOpen(false);
     setConfiguring(true); setError(''); setItems([]); setSelected(new Set()); currentIndexRef.current = 0; setCurrent(0); setScanResult(null); setScanned(false); setActiveDestination(null);
     try {
       const config = await api.setSource(sourceInput);
@@ -129,26 +137,36 @@ export default function MediaSorterApp() {
     }
   };
 
-  const scan = useCallback(async () => {
-    if (!folders.source || scanning) return;
+  const scan = useCallback(async (renameSync = false): Promise<boolean> => {
+    if (!folders.source || scanning) return false;
     setScanning(true); setError(''); setFeedback('Scanning source folder…');
     try {
       const result = await api.scan();
       if (result.sourceId !== folders.source.id) {
         setItems([]); setSelected(new Set()); currentIndexRef.current = 0; setCurrent(0); setScanResult(null); setScanned(false); setActiveDestination(null);
+        renameSyncRef.current = null; setNeedsRescan(false);
         try {
           const latest = await api.getFolders();
           setFolders(latest); setSourceInput(latest.source?.path ?? '');
         } catch { /* The cleared queue is safer than showing results for an outdated source. */ }
         const message = 'The source folder changed in another window. The old queue was cleared; review the current source and scan again.';
         setError(message); setFeedback(message);
-        return;
+        return false;
       }
       const priorId = currentItemId.current;
-      const newIndex = priorId ? result.items.findIndex(item => item.id === priorId) : -1;
+      const renameSyncState = renameSyncRef.current;
+      const renamedQueue = renameSyncState ? reconcileRenameQueue(result.items, renameSyncState) : null;
+      const newIndex = renamedQueue
+        ? renamedQueue.current
+        : priorId ? result.items.findIndex(item => item.id === priorId) : -1;
       const stillValid = new Set(result.items.map(item => item.id));
       setItems(result.items);
-      setSelected(old => new Set([...old].filter(id => stillValid.has(id))));
+      if (renamedQueue) {
+        setSelected(renamedQueue.selected);
+        rangeAnchorRef.current = renamedQueue.anchorId;
+        renameSyncRef.current = null;
+        setNeedsRescan(false);
+      } else setSelected(old => new Set([...old].filter(id => stillValid.has(id))));
       const nextCurrent = newIndex >= 0 ? newIndex : 0;
       currentIndexRef.current = nextCurrent;
       setCurrent(nextCurrent);
@@ -174,12 +192,20 @@ export default function MediaSorterApp() {
       });
       setScanResult(result); setScanned(true);
       setFeedback(result.warningCount ? `Scan complete with ${result.warningCount} warning${result.warningCount === 1 ? '' : 's'}.` : `Scan complete · ${result.count} media file${result.count === 1 ? '' : 's'} found.`);
+      return true;
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : 'The source folder could not be scanned.';
+      if (renameSync || needsRescan) {
+        setItems([]); setSelected(new Set()); currentIndexRef.current = 0; setCurrent(0); setScanResult(null); setScanned(false);
+        const syncMessage = `The rename result needs a queue refresh, but scanning failed. ${message} The old queue was cleared; retry the scan before using media actions.`;
+        setError(syncMessage); setFeedback(syncMessage);
+        return false;
+      }
       const displayMessage = items.length ? `Rescan failed. Previous results remain displayed. ${message}` : message;
       setError(displayMessage); setFeedback(displayMessage);
+      return false;
     } finally { setScanning(false); }
-  }, [folders.source, scanning]);
+  }, [folders.source, scanning, items.length, needsRescan]);
 
   const toggleSelected = (id: string) => {
     rangeAnchorRef.current = id;
@@ -278,6 +304,59 @@ export default function MediaSorterApp() {
   }, [currentItem, scanResult, selected, items, current]);
 
   const moveCurrentTo = useCallback((destination: ConfiguredFolder) => moveToDestination(destination), [moveToDestination]);
+
+  const openRename = useCallback(() => {
+    if (!currentItem || !scanResult || movingRef.current || scanning || needsRescan) return;
+    if (selected.size && (selected.size !== 1 || !selected.has(currentItem.id))) {
+      setFeedback('Clear the selection or select only the active item before renaming.');
+      return;
+    }
+    const extension = currentItem.extension;
+    setRenameName(extension && currentItem.filename.toLowerCase().endsWith(extension.toLowerCase())
+      ? currentItem.filename.slice(0, -extension.length) : currentItem.filename);
+    setRenameError(''); setRenameOpen(true);
+  }, [currentItem, scanResult, selected, scanning, needsRescan]);
+
+  const submitRename = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!currentItem || !scanResult || renameBusy || !renameName.trim()) {
+      if (!renameName.trim()) setRenameError('Enter a filename before the extension.');
+      return;
+    }
+    if (movingRef.current) { setRenameError('Wait for the current move to finish before renaming.'); return; }
+    setRenameBusy(true); setRenameError('');
+    const activeItem = currentItem;
+    const currentExtension = activeItem.extension;
+    const directoryPrefix = activeItem.relativePath.includes('/') ? activeItem.relativePath.slice(0, activeItem.relativePath.lastIndexOf('/') + 1) : '';
+    const newRelativePath = `${directoryPrefix}${renameName.trim()}${currentExtension}`;
+    const syncState = createRenameQueueSync(items, selected, activeItem.id, rangeAnchorRef.current, newRelativePath);
+    const uncertainSync = createRenameQueueSync(items, selected, activeItem.id, rangeAnchorRef.current, newRelativePath, true);
+    const refreshQueue = async (alternatives = false) => {
+      renameSyncRef.current = alternatives ? uncertainSync : syncState;
+      setItems([]); setSelected(new Set()); currentIndexRef.current = 0; setCurrent(0); setScanResult(null); setScanned(false); setNeedsRescan(true);
+      return scan(true);
+    };
+    try {
+      const response = await api.renameMedia(activeItem.id, scanResult.scanId, renameName.trim());
+      setRenameOpen(false);
+      if (response.unchanged) { setFeedback('The filename is already the same.'); return; }
+      setError(''); setFeedback(`Renamed to ${response.filename}. Refreshing the queue…`);
+      const refreshed = await refreshQueue();
+      if (refreshed) setFeedback(`Renamed to ${response.filename}; queue and preview are refreshed.`);
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : 'The file could not be renamed.';
+      const needsRefresh = reason instanceof ApiError && (reason.rescanRequired || reason.uncertain);
+      if (needsRefresh) {
+        setRenameOpen(false); setError('');
+        setFeedback(`${message} Refreshing the queue to check the current filename…`);
+        const refreshed = await refreshQueue(true);
+        if (refreshed) setFeedback(`The rename outcome was not confirmed. The queue was refreshed; verify the active filename before retrying.`);
+      } else {
+        setRenameError(message);
+        setError(message); setFeedback(message);
+      }
+    } finally { setRenameBusy(false); }
+  };
 
   const updateVideoForKey = (key: string, changes: Partial<VideoPreviewState>) => {
     if (previewKeyRef.current !== key) return;
@@ -390,7 +469,7 @@ export default function MediaSorterApp() {
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       const target = event.target instanceof HTMLElement ? event.target : null;
-      if (helpOpen || batchDetailsOpen) { if (event.key === 'Escape') { setHelpOpen(false); setBatchDetailsOpen(false); } return; }
+      if (helpOpen || batchDetailsOpen || renameOpen) { if (event.key === 'Escape') { setHelpOpen(false); setBatchDetailsOpen(false); if (!renameBusy) setRenameOpen(false); } return; }
       if (isEditableKeyboardTarget(target)) return;
       if (movingRef.current) return;
       const videoHasNativeFocus = Boolean(target?.closest('video'));
@@ -407,6 +486,7 @@ export default function MediaSorterApp() {
       }
       if (event.ctrlKey || event.metaKey || event.altKey || (event.shiftKey && event.key !== '?')) return;
       if (event.key === 'Escape') { setHelpOpen(false); return; }
+      if (event.key === 'F2') { event.preventDefault(); openRename(); return; }
       if (event.key === '?') { setHelpOpen(open => !open); return; }
       if (event.key.toLowerCase() === 's' && currentItem) { toggleSelected(currentItem.id); return; }
       if (event.key.toLowerCase() === 'q') { setQueueOpen(open => !open); return; }
@@ -430,7 +510,7 @@ export default function MediaSorterApp() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [items, currentItem, folders.destinations, selected.size, helpOpen, batchDetailsOpen, previewKey, moveCurrentTo, scanning, configuring]);
+  }, [items, currentItem, folders.destinations, selected.size, helpOpen, batchDetailsOpen, renameOpen, renameBusy, openRename, previewKey, moveCurrentTo, scanning, configuring]);
 
   useEffect(() => {
     const strip = filmstripRef.current;
@@ -459,10 +539,10 @@ export default function MediaSorterApp() {
     <header className="topbar">
       <a className="brand" href="#" aria-label="kilkul-media-sorter home"><span className="brand-mark"><Aperture size={17}/></span><span>kilkul-media-sorter</span></a>
       <form className="source-config" onSubmit={setSource}>
-        <label htmlFor="source-path">SOURCE</label><input id="source-path" value={sourceInput} onChange={event => setSourceInput(event.target.value)} placeholder="Absolute folder path, e.g. C:\\Photos or /Users/name/Photos" title={sourceLabel} autoComplete="off" spellCheck={false} disabled={configuring || loadingFolders || scanning || Boolean(movingId)}/>
-        <button className="text-button source-save" type="submit" disabled={configuring || loadingFolders || scanning || Boolean(movingId)}><FolderOpen size={14}/>{folders.source ? 'Change source' : 'Set source'}</button>
+        <label htmlFor="source-path">SOURCE</label><input id="source-path" value={sourceInput} onChange={event => setSourceInput(event.target.value)} placeholder="Absolute folder path, e.g. C:\\Photos or /Users/name/Photos" title={sourceLabel} autoComplete="off" spellCheck={false} disabled={configuring || loadingFolders || scanning || renameBusy || Boolean(movingId)}/>
+        <button className="text-button source-save" type="submit" disabled={configuring || loadingFolders || scanning || renameBusy || Boolean(movingId)}><FolderOpen size={14}/>{folders.source ? 'Change source' : 'Set source'}</button>
       </form>
-      <div className="top-actions"><span className="progress">{items.length ? String(current + 1).padStart(2, '0') : '—'} <span className="muted">/ {items.length || '—'}</span></span><button className="scan-button" onClick={() => void scan()} disabled={!folders.source || scanning || configuring || Boolean(movingId)}><ScanLine size={14}/>{scanning ? 'Scanning…' : scanned ? 'Rescan' : 'Scan'}</button><span className="divider"/><button className="icon-button theme-toggle" onClick={() => setTheme(value => value === 'dark' ? 'light' : 'dark')} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>{theme === 'dark' ? <Sun size={17}/> : <Moon size={17}/>}</button><button className="icon-button" onClick={() => setHelpOpen(true)} aria-label="Keyboard shortcuts"><CircleHelp size={17}/></button></div>
+      <div className="top-actions"><span className="progress">{items.length ? String(current + 1).padStart(2, '0') : '—'} <span className="muted">/ {items.length || '—'}</span></span><button className="scan-button" onClick={() => void scan(needsRescan)} disabled={!folders.source || scanning || configuring || renameBusy || Boolean(movingId)}><ScanLine size={14}/>{scanning ? 'Scanning…' : needsRescan ? 'Retry scan' : scanned ? 'Rescan' : 'Scan'}</button><span className="divider"/><button className="icon-button theme-toggle" onClick={() => setTheme(value => value === 'dark' ? 'light' : 'dark')} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>{theme === 'dark' ? <Sun size={17}/> : <Moon size={17}/>}</button><button className="icon-button" onClick={() => setHelpOpen(true)} aria-label="Keyboard shortcuts"><CircleHelp size={17}/></button></div>
     </header>
     <div className="workspace">
       <aside className="sidebar">
@@ -485,10 +565,10 @@ export default function MediaSorterApp() {
               {activeVideoState.status === 'error' ? <div className="preview-failure" role="status"><Film size={27}/><strong>Video preview unavailable</strong><span>{activeVideoState.message ?? 'The file could not be loaded or decoded. Its codec may not be supported.'}</span></div> : <><video key={previewKey} ref={videoRef} data-preview-key={previewKey} className="media-video" src={previewUrl} controls preload="metadata" playsInline onLoadStart={() => updateVideoForKey(previewKey, { status: 'loading' })} onLoadedMetadata={event => { const duration = Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : null; updateVideoForKey(previewKey, { duration, currentTime: event.currentTarget.currentTime }); }} onCanPlay={() => updateVideoForKey(previewKey, { status: 'ready' })} onWaiting={() => updateVideoForKey(previewKey, { status: 'buffering' })} onPlaying={() => updateVideoForKey(previewKey, { status: 'ready' })} onTimeUpdate={event => updateVideoForKey(previewKey, { currentTime: event.currentTarget.currentTime, duration: Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : null })} onError={event => { const code = event.currentTarget.error?.code; const message = code === MediaError.MEDIA_ERR_DECODE ? 'The browser could not decode this video. Its codec may not be supported.' : code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED ? 'The video source is unavailable or its format/codec is unsupported.' : 'The file could not be loaded. It may have changed or become unavailable.'; updateVideoForKey(previewKey, { status: 'error', message }); }}/>{(activeVideoState.status === 'loading' || activeVideoState.status === 'buffering') && <div className="video-loading" role="status">{activeVideoState.status === 'buffering' ? 'Buffering…' : 'Loading video…'}</div>}<div className="video-time" aria-live="off">{formatDuration(activeVideoState.currentTime)} / {formatDuration(activeVideoState.duration)}</div></>}
             </>}
           </div>
-          <div className="preview-bottom"><MediaDetails item={currentItem}/><div className="item-actions">{selectedDestination && <button className="move-button" onClick={() => void moveCurrentTo(selectedDestination)} disabled={Boolean(movingId)}>{movingId ? 'Moving…' : `Move ${selected.size ? `${selected.size} selected` : 'active'} to ${folderName(selectedDestination.path)}`}</button>}<button className={`select-button ${selected.has(currentItem.id) ? 'selected' : ''}`} onClick={() => toggleSelected(currentItem.id)} disabled={Boolean(movingId)}>{selected.has(currentItem.id) ? <Check size={15}/> : <Plus size={15}/>} {selected.has(currentItem.id) ? 'Selected' : 'Select'} <kbd>S</kbd></button></div></div>
+      <div className="preview-bottom"><MediaDetails item={currentItem}/><div className="item-actions"><button className="rename-button" onClick={openRename} disabled={Boolean(movingId) || scanning || needsRescan} title="Rename active item (F2)"><Pencil size={14}/> Rename <kbd>F2</kbd></button>{selectedDestination && <button className="move-button" onClick={() => void moveCurrentTo(selectedDestination)} disabled={Boolean(movingId) || needsRescan}>{movingId ? 'Moving…' : `Move ${selected.size ? `${selected.size} selected` : 'active'} to ${folderName(selectedDestination.path)}`}</button>}<button className={`select-button ${selected.has(currentItem.id) ? 'selected' : ''}`} onClick={() => toggleSelected(currentItem.id)} disabled={Boolean(movingId) || needsRescan}>{selected.has(currentItem.id) ? <Check size={15}/> : <Plus size={15}/>} {selected.has(currentItem.id) ? 'Selected' : 'Select'} <kbd>S</kbd></button></div></div>
           <button className="nav-arrow previous" onClick={() => navigate(-1)} aria-label="Previous item" disabled={items.length < 2 || Boolean(movingId)}><ChevronLeft size={20}/></button><button className="nav-arrow next" onClick={() => navigate(1)} aria-label="Next item" disabled={items.length < 2 || Boolean(movingId)}><ChevronRight size={20}/></button>
         </div> : <div className="empty-queue">{scanning ? <><span className="loading-mark"><ScanLine size={22}/></span><strong>Scanning source folder…</strong><span>Reading folder entries and supported-file metadata.</span></> : error && !folders.source ? <><strong>Local service unavailable</strong><span>{error}</span></> : !folders.source ? <><span className="empty-folder-icon"><FolderOpen size={28}/></span><strong>Select a source folder to get started</strong><span>Enter an absolute path above, then choose Scan.</span><small>Images and videos preview when supported by the browser. Files move only after you choose a destination action.</small></> : scanned && items.length === 0 ? <><span className="empty-folder-icon"><ImageIcon size={28}/></span><strong>No supported media found</strong><span>The source folder contains no supported image or video files.</span><button className="modal-done retry-scan" onClick={() => void scan()}><ScanLine size={14}/> Rescan</button></> : <><span className="empty-folder-icon"><ScanLine size={28}/></span><strong>Source folder is ready</strong><span>Scan to find supported media in this folder and its subfolders.</span></>}</div>}
-        <div className="preview-footer"><div className={`status-message ${error ? 'error-status' : ''}`} role={error ? 'alert' : 'status'}><span className={`status-dot ${error ? 'error-dot' : 'subdued'}`}/>{error || feedback}</div><div className="shortcut-strip"><span><kbd>←</kbd><kbd>→</kbd> Navigate</span><span><kbd>S</kbd> Select</span><span><kbd>?</kbd> Shortcuts</span></div></div>
+        <div className="preview-footer"><div className={`status-message ${error ? 'error-status' : ''}`} role={error ? 'alert' : 'status'}><span className={`status-dot ${error ? 'error-dot' : 'subdued'}`}/>{error || feedback}{needsRescan && <button className="select-all-button" onClick={() => void scan(true)} disabled={scanning}><ScanLine size={13}/>{scanning ? 'Refreshing…' : 'Retry queue refresh'}</button>}</div><div className="shortcut-strip"><span><kbd>←</kbd><kbd>→</kbd> Navigate</span><span><kbd>S</kbd> Select</span><span><kbd>F2</kbd> Rename</span><span><kbd>?</kbd> Shortcuts</span></div></div>
         {!scanning && scanResult?.warningCount ? <details className="scan-warning"><summary>Scan found {scanResult.count} items with {scanResult.warningCount} warning{scanResult.warningCount === 1 ? '' : 's'}.</summary><ul>{scanResult.warnings.map((warning, index) => <li key={`${index}-${warning}`}>{warning}</li>)}</ul></details> : null}
       </section>
     </div>
@@ -511,6 +591,7 @@ export default function MediaSorterApp() {
       {(batchReport.requestUncertain || batchReport.results.some(result => result.status === 'failed' && result.uncertain)) && <button className="modal-done batch-recover" onClick={() => void scan()} disabled={scanning}><ScanLine size={14}/>{scanning ? 'Rescanning…' : 'Rescan source to recover'}</button>}
       <button className="modal-done" onClick={() => setBatchDetailsOpen(false)}>Close</button>
     </section></div>}
-    {helpOpen && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setHelpOpen(false); }}><section className="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title"><div className="modal-heading"><div><span className="eyebrow">QUICK REFERENCE</span><h2 id="help-title">Keyboard shortcuts</h2></div><button className="icon-button" onClick={() => setHelpOpen(false)} aria-label="Close shortcuts"><X size={18}/></button></div><div className="shortcut-list"><div><span>Navigate · hold to repeat</span><span><kbd>←</kbd><kbd>→</kbd></span></div><div><span>Select current item</span><kbd>S</kbd></div><div><span>Select all / clear all</span><kbd>{/Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl'} + A</kbd></div><div><span>Video seek; hold to continue</span><span><kbd>J</kbd><kbd>L</kbd> · 5 sec</span></div><div><span>Video play / pause</span><span><kbd>K</kbd> / <kbd>Space</kbd></span></div><div><span>Move selection or active item</span><span className="destination-shortcuts">{folders.destinations.slice(0, 9).map((destination, index) => <span key={destination.id}>{folderName(destination.path)} <kbd>{index + 1}</kbd></span>)}</span></div><div><span>Toggle queue panel</span><kbd>Q</kbd></div><div><span>Open shortcut help</span><kbd>?</kbd></div><div><span>Close dialog</span><kbd>Esc</kbd></div></div><p className="modal-note"><Keyboard size={14}/> Hold J/L to keep seeking in five-second steps. Hold Shift with an arrow to extend or contract a queue-order range. Range selection replaces the previous selection. If one or more files are selected, Move and destination number keys move the selection. With no selection, they move the active item. Ctrl+A / ⌘A selects or clears the queue; shortcuts are inactive in editable fields or while a dialog is open. Batch moves return per-file results and may partially succeed.</p><button className="modal-done" onClick={() => setHelpOpen(false)}>Done <ChevronRight size={15}/></button></section></div>}
+    {renameOpen && currentItem && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget && !renameBusy) setRenameOpen(false); }}><section className="help-modal rename-modal" role="dialog" aria-modal="true" aria-labelledby="rename-title"><div className="modal-heading"><div><span className="eyebrow">RENAME FILE</span><h2 id="rename-title">Rename active item</h2></div><button className="icon-button" onClick={() => setRenameOpen(false)} aria-label="Cancel rename" disabled={renameBusy}><X size={18}/></button></div><form onSubmit={event => void submitRename(event)}><label className="rename-label" htmlFor="rename-basename">New filename</label><div className="rename-field"><input id="rename-basename" value={renameName} onChange={event => setRenameName(event.target.value)} autoFocus disabled={renameBusy} aria-describedby="rename-extension rename-error"/><span className="extension-hint" id="rename-extension">{currentItem.extension || 'No extension'}</span></div><p className="rename-description">Enter the name before the extension. The existing extension is retained automatically.</p><p className={`rename-error ${renameError ? 'visible' : ''}`} id="rename-error" role="alert">{renameError}</p><div className="rename-actions"><button type="button" className="cancel-button" onClick={() => setRenameOpen(false)} disabled={renameBusy}>Cancel <kbd>Esc</kbd></button><button type="submit" className="move-button rename-submit" disabled={renameBusy}>{renameBusy ? 'Renaming…' : 'Rename'} <kbd>Enter</kbd></button></div></form></section></div>}
+    {helpOpen && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setHelpOpen(false); }}><section className="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title"><div className="modal-heading"><div><span className="eyebrow">QUICK REFERENCE</span><h2 id="help-title">Keyboard shortcuts</h2></div><button className="icon-button" onClick={() => setHelpOpen(false)} aria-label="Close shortcuts"><X size={18}/></button></div><div className="shortcut-list"><div><span>Navigate · hold to repeat</span><span><kbd>←</kbd><kbd>→</kbd></span></div><div><span>Rename active item</span><kbd>F2</kbd></div><div><span>Select current item</span><kbd>S</kbd></div><div><span>Select all / clear all</span><kbd>{/Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl'} + A</kbd></div><div><span>Video seek; hold to continue</span><span><kbd>J</kbd><kbd>L</kbd> · 5 sec</span></div><div><span>Video play / pause</span><span><kbd>K</kbd> / <kbd>Space</kbd></span></div><div><span>Move selection or active item</span><span className="destination-shortcuts">{folders.destinations.slice(0, 9).map((destination, index) => <span key={destination.id}>{folderName(destination.path)} <kbd>{index + 1}</kbd></span>)}</span></div><div><span>Toggle queue panel</span><kbd>Q</kbd></div><div><span>Open shortcut help</span><kbd>?</kbd></div><div><span>Close dialog</span><kbd>Esc</kbd></div></div><p className="modal-note"><Keyboard size={14}/> Hold J/L to keep seeking in five-second steps. Hold Shift with an arrow to extend or contract a queue-order range. Range selection replaces the previous selection. If one or more files are selected, Move and destination number keys move the selection. With no selection, they move the active item. Ctrl+A / ⌘A selects or clears the queue; shortcuts are inactive in editable fields or while a dialog is open. Batch moves return per-file results and may partially succeed.</p><button className="modal-done" onClick={() => setHelpOpen(false)}>Done <ChevronRight size={15}/></button></section></div>}
   </main>;
 }
