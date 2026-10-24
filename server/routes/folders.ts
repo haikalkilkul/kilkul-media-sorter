@@ -10,8 +10,8 @@ export function registerFolderRoutes(app: FastifyInstance, registry: FolderRegis
   app.get('/api/folders', async () => registry.getConfiguration());
 
   app.put<{ Body: { path: string } }>('/api/folders/source', { schema: { body: pathBody } }, async (request, reply) => {
-    const source = await registry.setSource(request.body.path);
-    return reply.send({ source, destinations: registry.getConfiguration().destinations });
+    await registry.setSource(request.body.path);
+    return reply.send(await registry.getConfiguration());
   });
 
   app.post<{ Body: { path: string } }>('/api/folders/destinations', { schema: { body: pathBody } }, async (request, reply) => {
@@ -22,8 +22,15 @@ export function registerFolderRoutes(app: FastifyInstance, registry: FolderRegis
   app.delete<{ Params: { id: string } }>('/api/folders/destinations/:id', {
     schema: { params: { type: 'object', required: ['id'], properties: { id: { type: 'string', format: 'uuid' } } } },
   }, async (request, reply) => {
-    if (!registry.removeDestination(request.params.id)) return reply.code(404).send({ error: 'Destination not found.' });
+    if (!await registry.removeDestination(request.params.id)) return reply.code(404).send({ error: 'Destination not found.' });
     return reply.code(204).send();
+  });
+
+  app.post<{ Body: { confirm: true } }>('/api/folders/recover', {
+    schema: { body: { type: 'object', additionalProperties: false, required: ['confirm'], properties: { confirm: { const: true } } } },
+  }, async (_request, reply) => {
+    await registry.recoverConfiguration();
+    return reply.send(await registry.getConfiguration());
   });
 
   // Client paths are intentionally forbidden here: scan always uses server-held source configuration.

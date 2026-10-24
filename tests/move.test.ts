@@ -16,7 +16,7 @@ async function setup(options: { registry?: FolderRegistry; sourceName?: string }
   const destination = path.join(root, 'destination');
   await mkdir(source, { recursive: true });
   await mkdir(destination);
-  const app = await createApp({ logger: false, ...(options.registry ? { registry: options.registry } : {}) });
+  const app = await createApp({ logger: false, configPath: null, ...(options.registry ? { registry: options.registry } : {}) });
   await app.inject({ method: 'PUT', url: '/api/folders/source', headers, payload: { path: source } });
   const configuredDestination = await app.inject({ method: 'POST', url: '/api/folders/destinations', headers, payload: { path: destination } });
   const scan = await app.inject({ method: 'POST', url: '/api/scan', headers, payload: {} });

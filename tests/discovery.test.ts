@@ -64,7 +64,7 @@ describe('folder and scan API', () => {
     const root = await temporaryDirectory();
     const source = path.join(root, 'source');
     const destination = path.join(root, 'destination');
-    const app = await createApp({ logger: false });
+    const app = await createApp({ logger: false, configPath: null });
     try {
       await mkdir(source);
       await mkdir(path.join(source, 'trip'), { recursive: true });

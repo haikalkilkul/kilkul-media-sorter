@@ -1,5 +1,5 @@
-export type ConfiguredFolder = { id: string; path: string };
-export type FolderConfiguration = { source: ConfiguredFolder | null; destinations: ConfiguredFolder[] };
+export type ConfiguredFolder = { id: string; path: string; available: boolean; warning?: string };
+export type FolderConfiguration = { source: ConfiguredFolder | null; destinations: ConfiguredFolder[]; recoveryRequired: boolean; warning?: string };
 export type MediaItem = {
   id: string;
   filename: string;
@@ -37,6 +37,7 @@ export const api = {
   setSource: (path: string) => request<FolderConfiguration>('/api/folders/source', { method: 'PUT', headers: jsonHeaders, body: JSON.stringify({ path }) }),
   addDestination: (path: string) => request<ConfiguredFolder>('/api/folders/destinations', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ path }) }),
   removeDestination: (id: string) => request<void>(`/api/folders/destinations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  recoverConfiguration: () => request<FolderConfiguration>('/api/folders/recover', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ confirm: true }) }),
   scan: () => request<ScanResult>('/api/scan', { method: 'POST', headers: jsonHeaders, body: '{}' }),
   renameMedia: async (id: string, scanId: string, basename: string) => {
     try { return await request<{ filename: string; unchanged: boolean }>(`/api/media/${encodeURIComponent(id)}/rename`, { method: 'PATCH', headers: jsonHeaders, body: JSON.stringify({ scanId, basename }) }); }

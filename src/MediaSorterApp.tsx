@@ -26,7 +26,7 @@ function folderName(folderPath: string): string {
 }
 
 export default function MediaSorterApp() {
-  const [folders, setFolders] = useState<FolderConfiguration>({ source: null, destinations: [] });
+  const [folders, setFolders] = useState<FolderConfiguration>({ source: null, destinations: [], recoveryRequired: false });
   const [sourceInput, setSourceInput] = useState('');
   const [destinationInput, setDestinationInput] = useState('');
   const [items, setItems] = useState<MediaItem[]>([]);
@@ -97,12 +97,13 @@ export default function MediaSorterApp() {
   const setSource = async (event: FormEvent<HTMLFormElement>) => {
     if (movingRef.current) return;
     event.preventDefault();
-    renameSyncRef.current = null; setNeedsRescan(false); setRenameOpen(false);
-    setConfiguring(true); setError(''); setItems([]); setSelected(new Set()); currentIndexRef.current = 0; setCurrent(0); setScanResult(null); setScanned(false); setActiveDestination(null);
+    setConfiguring(true); setError('');
     try {
       const config = await api.setSource(sourceInput);
       setFolders(config);
       setSourceInput(config.source?.path ?? '');
+      renameSyncRef.current = null; setNeedsRescan(false); setRenameOpen(false);
+      setItems([]); setSelected(new Set()); currentIndexRef.current = 0; setCurrent(0); setScanResult(null); setScanned(false); setActiveDestination(null);
       setFeedback('Source folder saved. Scan it to load media.');
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : 'Could not configure that source folder.';
@@ -124,7 +125,7 @@ export default function MediaSorterApp() {
   };
 
   const removeDestination = async (destination: ConfiguredFolder) => {
-    if (movingRef.current) return;
+    if (movingRef.current || folders.recoveryRequired) return;
     setError('');
     try {
       await api.removeDestination(destination.id);
@@ -135,6 +136,21 @@ export default function MediaSorterApp() {
       const message = reason instanceof Error ? reason.message : 'Could not remove that destination.';
       setError(message); setFeedback(message);
     }
+  };
+
+  const recoverConfiguration = async () => {
+    const confirmed = window.confirm('The saved configuration file is invalid. Its original contents will be backed up, then replaced with an empty valid configuration. Continue?');
+    if (!confirmed) return;
+    setConfiguring(true); setError('');
+    try {
+      const recovered = await api.recoverConfiguration();
+      setFolders(recovered); setSourceInput(''); setItems([]); setSelected(new Set());
+      currentIndexRef.current = 0; setCurrent(0); setScanResult(null); setScanned(false); setActiveDestination(null);
+      setFeedback('Configuration recovered. Set a source folder and add destinations again.');
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : 'Configuration recovery failed.';
+      setError(message); setFeedback(message);
+    } finally { setConfiguring(false); }
   };
 
   const scan = useCallback(async (renameSync = false): Promise<boolean> => {
@@ -539,24 +555,27 @@ export default function MediaSorterApp() {
     <header className="topbar">
       <a className="brand" href="#" aria-label="kilkul-media-sorter home"><span className="brand-mark"><Aperture size={17}/></span><span>kilkul-media-sorter</span></a>
       <form className="source-config" onSubmit={setSource}>
-        <label htmlFor="source-path">SOURCE</label><input id="source-path" value={sourceInput} onChange={event => setSourceInput(event.target.value)} placeholder="Absolute folder path, e.g. C:\\Photos or /Users/name/Photos" title={sourceLabel} autoComplete="off" spellCheck={false} disabled={configuring || loadingFolders || scanning || renameBusy || Boolean(movingId)}/>
-        <button className="text-button source-save" type="submit" disabled={configuring || loadingFolders || scanning || renameBusy || Boolean(movingId)}><FolderOpen size={14}/>{folders.source ? 'Change source' : 'Set source'}</button>
+        <label htmlFor="source-path">SOURCE</label><input id="source-path" value={sourceInput} onChange={event => setSourceInput(event.target.value)} placeholder="Absolute folder path, e.g. C:\\Photos or /Users/name/Photos" title={folders.source?.warning ?? sourceLabel} autoComplete="off" spellCheck={false} disabled={configuring || loadingFolders || scanning || renameBusy || folders.recoveryRequired || Boolean(movingId)}/>
+        <button className="text-button source-save" type="submit" disabled={configuring || loadingFolders || scanning || renameBusy || folders.recoveryRequired || Boolean(movingId)}><FolderOpen size={14}/>{folders.source ? 'Change source' : 'Set source'}</button>
       </form>
       <div className="top-actions"><span className="progress">{items.length ? String(current + 1).padStart(2, '0') : '—'} <span className="muted">/ {items.length || '—'}</span></span><button className="scan-button" onClick={() => void scan(needsRescan)} disabled={!folders.source || scanning || configuring || renameBusy || Boolean(movingId)}><ScanLine size={14}/>{scanning ? 'Scanning…' : needsRescan ? 'Retry scan' : scanned ? 'Rescan' : 'Scan'}</button><span className="divider"/><button className="icon-button theme-toggle" onClick={() => setTheme(value => value === 'dark' ? 'light' : 'dark')} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>{theme === 'dark' ? <Sun size={17}/> : <Moon size={17}/>}</button><button className="icon-button" onClick={() => setHelpOpen(true)} aria-label="Keyboard shortcuts"><CircleHelp size={17}/></button></div>
     </header>
+    {folders.recoveryRequired
+      ? <div className="config-recovery-banner" role="alert"><span>{folders.warning ?? 'The saved folder configuration is invalid and has been preserved.'}</span><button type="button" onClick={() => void recoverConfiguration()} disabled={configuring}><Check size={14}/> Back up and reset configuration</button></div>
+      : folders.warning ? <div className="config-recovery-banner config-info-banner" role="status">{folders.warning}</div> : null}
     <div className="workspace">
       <aside className="sidebar">
         <div className="section-heading"><span>DESTINATIONS</span><span className="shortcut-caption">1–9</span></div>
         <p className="aside-caption">Click to select · number keys move selected files</p>
         <nav className="destination-list" aria-label="Configured destinations">
-          {folders.destinations.map((destination, index) => <div key={destination.id} className={`destination-row ${activeDestination === destination.id ? 'active' : ''}`}><button className="destination" onClick={() => chooseDestination(destination)} title={destination.path} disabled={Boolean(movingId)}><span className={`folder-icon tone-${index % 4}`}><FolderOpen size={15}/></span><span className="destination-label"><b>{folderName(destination.path)}</b><small>{destination.path}</small></span><kbd>{index < 9 ? index + 1 : '—'}</kbd></button><button className="remove-destination" onClick={() => void removeDestination(destination)} aria-label={`Remove destination ${destination.path}`} title="Remove destination" disabled={Boolean(movingId)}><X size={14}/></button></div>)}
+          {folders.destinations.map((destination, index) => <div key={destination.id} className={`destination-row ${activeDestination === destination.id ? 'active' : ''} ${destination.available ? '' : 'unavailable'}`}><button className="destination" onClick={() => chooseDestination(destination)} title={destination.warning ?? destination.path} disabled={Boolean(movingId)}><span className={`folder-icon tone-${index % 4}`}><FolderOpen size={15}/></span><span className="destination-label"><b>{folderName(destination.path)}{!destination.available && <em>Unavailable</em>}</b><small>{destination.path}</small></span><kbd>{index < 9 ? index + 1 : '—'}</kbd></button><button className="remove-destination" onClick={() => void removeDestination(destination)} aria-label={`Remove destination ${destination.path}`} title="Remove destination" disabled={Boolean(movingId) || folders.recoveryRequired}><X size={14}/></button></div>)}
           {!folders.destinations.length && <p className="empty-destinations">Add a destination path below.</p>}
         </nav>
-        <form className="destination-form" onSubmit={addDestination}><label htmlFor="destination-path">Add destination folder</label><input id="destination-path" value={destinationInput} onChange={event => setDestinationInput(event.target.value)} placeholder="Absolute folder path" autoComplete="off" spellCheck={false} disabled={Boolean(movingId)}/><button className="add-destination" type="submit" disabled={!destinationInput.trim() || configuring || Boolean(movingId)}><Plus size={14}/> Add destination</button></form>
+        <form className="destination-form" onSubmit={addDestination}><label htmlFor="destination-path">Add destination folder</label><input id="destination-path" value={destinationInput} onChange={event => setDestinationInput(event.target.value)} placeholder="Absolute folder path" autoComplete="off" spellCheck={false} disabled={Boolean(movingId) || folders.recoveryRequired}/><button className="add-destination" type="submit" disabled={!destinationInput.trim() || configuring || Boolean(movingId) || folders.recoveryRequired}><Plus size={14}/> Add destination</button></form>
         <div className="sidebar-bottom"><div className="key-hint"><span>Move selection or active file</span><kbd>1–9</kbd></div><p>Selected files move into the destination root. With no selection, the active file moves. Name conflicts receive a new filename.</p></div>
       </aside>
       <section className="main-content" aria-label="Media queue">
-        <div className="preview-toolbar"><div className="breadcrumb"><span>{folders.source ? 'Source' : 'Get started'}</span><ChevronRight size={14}/><span className="muted" title={sourceLabel}>{folders.source ? folderName(folders.source.path) : sourceLabel}</span></div><span className="preview-count">{items.length ? String(current + 1).padStart(2, '0') : '—'} <span>/ {items.length || '—'}</span></span></div>
+        <div className="preview-toolbar"><div className="breadcrumb"><span>{folders.source ? 'Source' : 'Get started'}</span><ChevronRight size={14}/><span className="muted" title={sourceLabel}>{folders.source ? folderName(folders.source.path) : sourceLabel}</span></div>{folders.source && !folders.source.available && <span className="folder-warning" role="status" title={folders.source.warning}>{folders.source.warning ?? 'The source folder is unavailable.'}</span>}<span className="preview-count">{items.length ? String(current + 1).padStart(2, '0') : '—'} <span>/ {items.length || '—'}</span></span></div>
         {currentItem ? <div className="preview-stage media-stage">
           <div className={`media-player-frame ${currentItem.mediaType}`}>
             {currentItem.mediaType === 'image' ? <>

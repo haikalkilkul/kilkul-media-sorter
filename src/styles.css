@@ -124,6 +124,19 @@ body{min-width:0;overflow:hidden}
 :root[data-theme="light"] .move-button:hover:not(:disabled){background:#dce8d1}
 .queue-move-button{height:25px;max-width:180px}
 .batch-indeterminate{display:block;width:100%;height:2px;margin-top:5px;overflow:hidden;background:var(--line)}
+.config-recovery-banner{display:flex;align-items:center;justify-content:center;gap:14px;padding:8px 16px;border-bottom:1px solid #a57c3d66;background:#332b1e;color:#e1c991;font-size:11px;flex:0 0 auto}
+.config-recovery-banner button{display:inline-flex;align-items:center;justify-content:center;gap:6px;flex:0 0 auto;border:1px solid #a57c3d88;border-radius:4px;background:#453920;color:#f0d69c;padding:6px 9px;font-size:10px;cursor:pointer}
+.config-recovery-banner button:hover:not(:disabled){background:#554528}
+.config-recovery-banner button:disabled{opacity:.5;cursor:wait}
+.config-info-banner{justify-content:flex-start}
+.folder-warning{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#d8bd88;font-size:10px}
+.destination-label em{margin-left:5px;color:#d8bd88;font-size:8px;font-style:normal}
+.destination-row.unavailable .destination{color:var(--muted)}
+:root[data-theme="light"] .config-recovery-banner{background:#f5edda;color:#795b24;border-color:#ddc99f}
+:root[data-theme="light"] .config-recovery-banner button{background:#f1e5c8;border-color:#d4ba83;color:#674b1d}
+:root[data-theme="light"] .config-recovery-banner button:hover:not(:disabled){background:#e9d9b4}
+:root[data-theme="light"] .folder-warning,:root[data-theme="light"] .destination-label em{color:#8d641d}
+@media(max-width:760px){.config-recovery-banner{align-items:flex-start;flex-direction:column;gap:6px}.preview-toolbar{gap:8px}.folder-warning{flex:1 1 auto}}
 .batch-indeterminate:after{content:"";display:block;width:28%;height:100%;background:var(--focus);animation:batch-progress 1.2s ease-in-out infinite alternate}
 @keyframes batch-progress{from{transform:translateX(0)}to{transform:translateX(255%)}}
 .batch-result-list{list-style:none;margin:5px 0 0;padding:0;display:grid;gap:3px}

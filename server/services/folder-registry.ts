@@ -4,9 +4,11 @@ import { constants } from 'node:fs';
 import path from 'node:path';
 import { discoverMediaWithIndex, type DiscoveryResult, type MediaFingerprint } from './media-discovery.js';
 import { FileMoveError, moveFileNoOverwrite, type LinkOperation } from './file-mover.js';
+import { ConfigurationStore } from './config-store.js';
 
-export type ConfiguredFolder = { id: string; path: string };
-export type FolderConfiguration = { source: ConfiguredFolder | null; destinations: ConfiguredFolder[] };
+export type ConfiguredFolder = { id: string; path: string; available: boolean; warning?: string };
+export type FolderConfiguration = { source: ConfiguredFolder | null; destinations: ConfiguredFolder[]; recoveryRequired: boolean; warning?: string };
+type RuntimeFolder = { id: string; path: string };
 export type OpenMedia = { handle: FileHandle; sizeBytes: number; mediaType: 'image' | 'video'; extension: string; signal: AbortSignal };
 export type MoveResult = { id: string; destinationId: string; filename: string; strategy: 'hard-link' | 'verified-copy' };
 export type BatchMoveResult =
@@ -58,8 +60,8 @@ async function validateDirectory(input: string, role: 'source' | 'destination'):
 }
 
 export class FolderRegistry {
-  private source: ConfiguredFolder | null = null;
-  private destinations: ConfiguredFolder[] = [];
+  private source: RuntimeFolder | null = null;
+  private destinations: RuntimeFolder[] = [];
   private readonly idSecret = randomBytes(32);
   private fingerprints = new Map<string, MediaFingerprint>();
   private media = new Map<string, DiscoveryResult['items'][number]>();
@@ -70,48 +72,94 @@ export class FolderRegistry {
   private movingDestinations = new Map<string, number>();
   private movingBatches = new Set<string>();
   private readonly linkFile?: LinkOperation;
+  private readonly configurationStore?: ConfigurationStore;
+  private configurationWriteQueue: Promise<void> = Promise.resolve();
 
-  constructor(options: { linkFile?: LinkOperation } = {}) { this.linkFile = options.linkFile; }
+  constructor(options: { linkFile?: LinkOperation; configurationStore?: ConfigurationStore } = {}) {
+    this.linkFile = options.linkFile;
+    this.configurationStore = options.configurationStore;
+  }
 
-  getConfiguration(): FolderConfiguration {
-    return { source: this.source ? { ...this.source } : null, destinations: this.destinations.map(folder => ({ ...folder })) };
+  async loadConfiguration(): Promise<void> {
+    if (!this.configurationStore) return;
+    const loaded = await this.configurationStore.load();
+    this.source = loaded.configuration.sourcePath ? { id: randomUUID(), path: loaded.configuration.sourcePath } : null;
+    this.destinations = loaded.configuration.destinationPaths.map(folderPath => ({ id: randomUUID(), path: folderPath }));
+    this.fingerprints.clear(); this.media.clear(); this.currentScanId = null; this.scanVersion += 1;
+  }
+
+  async getConfiguration(): Promise<FolderConfiguration> {
+    const availability = async (folder: RuntimeFolder, role: 'source' | 'destination'): Promise<ConfiguredFolder> => {
+      try {
+        await validateDirectory(folder.path, role);
+        return { ...folder, available: true };
+      } catch (error) {
+        return { ...folder, available: false, warning: error instanceof Error ? error.message : 'This folder is unavailable.' };
+      }
+    };
+    const source = this.source ? await availability(this.source, 'source') : null;
+    const destinations = await Promise.all(this.destinations.map(folder => availability(folder, 'destination')));
+    const recovery = this.configurationStore?.getRecoveryStatus() ?? { recoveryRequired: false };
+    return { source, destinations, ...recovery };
+  }
+
+  async recoverConfiguration(): Promise<void> {
+    if (!this.configurationStore) return;
+    await this.withConfigurationLock(async () => {
+      if (this.movingMedia.size) throw new FolderError('A file operation is in progress. Wait for it to finish before recovering configuration.', 409);
+      await this.configurationStore!.recoverWithEmptyConfiguration();
+      this.source = null; this.destinations = [];
+      this.invalidateScan();
+    });
+  }
+
+  private persistConfiguration(sourcePath: string | null, destinationPaths: string[]): Promise<void> {
+    if (!this.configurationStore) return Promise.resolve();
+    return this.configurationStore.save({ version: 1, sourcePath, destinationPaths });
   }
 
   async setSource(input: string): Promise<ConfiguredFolder> {
     if (this.movingMedia.size) throw new FolderError('A file move is in progress. Wait for it to finish before changing the source folder.', 409);
     const folderPath = await validateDirectory(input, 'source');
-    for (const destination of this.destinations) {
-      if (pathsOverlap(folderPath, destination.path)) {
+    return this.withConfigurationLock(async () => {
+      if (this.movingMedia.size) throw new FolderError('A file move is in progress. Wait for it to finish before changing the source folder.', 409);
+      for (const destination of this.destinations) if (pathsOverlap(folderPath, destination.path)) {
         throw new FolderError('The source folder cannot be the same as, inside, or contain a destination folder.', 400);
       }
-    }
-    this.scanVersion += 1;
-    this.previewController.abort();
-    this.previewController = new AbortController();
-    this.source = { id: randomUUID(), path: folderPath };
-    this.fingerprints.clear();
-    this.media.clear();
-    this.currentScanId = null;
-    return { ...this.source };
+      await this.persistConfiguration(folderPath, this.destinations.map(folder => folder.path));
+      this.invalidateScan();
+      this.source = { id: randomUUID(), path: folderPath };
+      return { ...this.source, available: true };
+    });
   }
 
   async addDestination(input: string): Promise<ConfiguredFolder> {
     const folderPath = await validateDirectory(input, 'destination');
-    if (this.source && pathsOverlap(this.source.path, folderPath)) {
-      throw new FolderError('A destination cannot be the same as, inside, or contain the source folder.', 400);
-    }
-    if (this.destinations.some(folder => folder.path === folderPath)) throw new FolderError('That destination is already configured.', 409);
-    const folder = { id: randomUUID(), path: folderPath };
-    this.destinations.push(folder);
-    return { ...folder };
+    return this.withConfigurationLock(async () => {
+      if (this.source && pathsOverlap(this.source.path, folderPath)) throw new FolderError('A destination cannot be the same as, inside, or contain the source folder.', 400);
+      if (this.destinations.some(folder => folder.path === folderPath)) throw new FolderError('That destination is already configured.', 409);
+      const next = [...this.destinations, { id: randomUUID(), path: folderPath }];
+      await this.persistConfiguration(this.source?.path ?? null, next.map(folder => folder.path));
+      this.destinations = next;
+      return { ...next[next.length - 1], available: true };
+    });
   }
 
-  removeDestination(id: string): boolean {
-    if (this.movingDestinations.has(id)) throw new FolderError('A file is being moved to that destination. Try again when it finishes.', 409);
-    const remaining = this.destinations.filter(folder => folder.id !== id);
-    if (remaining.length === this.destinations.length) return false;
-    this.destinations = remaining;
-    return true;
+  async removeDestination(id: string): Promise<boolean> {
+    return this.withConfigurationLock(async () => {
+      if (this.movingDestinations.has(id)) throw new FolderError('A file is being moved to that destination. Try again when it finishes.', 409);
+      const remaining = this.destinations.filter(folder => folder.id !== id);
+      if (remaining.length === this.destinations.length) return false;
+      await this.persistConfiguration(this.source?.path ?? null, remaining.map(folder => folder.path));
+      this.destinations = remaining;
+      return true;
+    });
+  }
+
+  private withConfigurationLock<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.configurationWriteQueue.then(operation);
+    this.configurationWriteQueue = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   async scan(): Promise<{ sourceId: string; scanId: string; result: DiscoveryResult }> {

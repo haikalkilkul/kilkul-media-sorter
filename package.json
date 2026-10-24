@@ -9,7 +9,7 @@
     "dev:server": "tsx watch server/index.ts",
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --pretty",
-    "test": "tsx --test tests/filename.test.ts tests/discovery.test.ts tests/media-details.test.ts tests/video-seek.test.ts tests/move.test.ts tests/rename.test.ts tests/rename-queue.test.ts tests/batch-ui.test.ts tests/queue-navigation.test.ts",
+    "test": "tsx --test tests/filename.test.ts tests/discovery.test.ts tests/configuration.test.ts tests/media-details.test.ts tests/video-seek.test.ts tests/move.test.ts tests/rename.test.ts tests/rename-queue.test.ts tests/batch-ui.test.ts tests/queue-navigation.test.ts",
     "start:server": "tsx server/index.ts"
   },
   "dependencies": {

@@ -12,7 +12,7 @@ async function setup() {
   const source = path.join(root, 'source');
   await mkdir(path.join(source, 'nested'), { recursive: true });
   await writeFile(path.join(source, 'nested', 'photo.jpg'), 'original-bytes');
-  const app = await createApp({ logger: false });
+  const app = await createApp({ logger: false, configPath: null });
   await app.inject({ method: 'PUT', url: '/api/folders/source', headers, payload: { path: source } });
   const scan = (await app.inject({ method: 'POST', url: '/api/scan', headers, payload: {} })).json();
   return { app, root, source, scan, item: scan.items[0] as { id: string; filename: string; relativePath: string; extension: string } };
